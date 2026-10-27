@@ -237,11 +237,12 @@ pub(crate) enum ListType {
     Numbered,
 }
 
-/// One level of a list definition (`w:abstractNum/w:lvl`), as far as painting its label needs it.
+/// One level of a list definition (`w:abstractNum/w:lvl`, or a list's own
+/// `w:lvlOverride/w:lvl`), as far as painting its label needs it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct NumberingLevel {
-    /// `w:start`. ISO/IEC 29500-1 §17.9.26 makes an omitted start zero, not one.
-    pub(crate) start: i64,
+    /// `w:start`, when written. ISO/IEC 29500-1 §17.9.26 makes an omitted start zero, not one.
+    pub(crate) start: Option<i64>,
     /// `w:numFmt`. An omitted format is decimal (§17.9.18).
     pub(crate) num_fmt: Option<String>,
     /// `w:lvlText`, the label's template: `%1` to `%9` stand for the counters of levels 1 to 9
@@ -262,6 +263,9 @@ pub(crate) struct NumberingLevel {
 pub(crate) struct NumberingLevels {
     /// `w:abstractNum/w:lvl` by `(abstractNumId, ilvl)`.
     definitions: AHashMap<(i64, i64), NumberingLevel>,
+    /// `w:num/w:lvlOverride/w:lvl` by `(numId, ilvl)`: a list's own definition of one level,
+    /// used in place of the shared one.
+    level_overrides: AHashMap<(i64, i64), NumberingLevel>,
     /// The definition (`w:abstractNumId`) each list (`w:num`) uses.
     num_to_abstract: AHashMap<i64, i64>,
     /// `w:num/w:lvlOverride/w:startOverride` by `(numId, ilvl)`: how Word restarts a list.
@@ -269,19 +273,53 @@ pub(crate) struct NumberingLevels {
 }
 
 impl NumberingLevels {
-    /// The definition of one level of a list.
+    /// The definition one level of a list is painted with: the list's own override, else the
+    /// definition it shares.
     fn definition(&self, num_id: i64, level: usize) -> Option<&NumberingLevel> {
+        self.level_overrides
+            .get(&(num_id, level as i64))
+            .or_else(|| self.shared_definition(num_id, level))
+    }
+
+    /// The level of the definition (`w:abstractNum`) a list shares.
+    fn shared_definition(&self, num_id: i64, level: usize) -> Option<&NumberingLevel> {
         let abstract_id = self.num_to_abstract.get(&num_id)?;
         self.definitions.get(&(*abstract_id, level as i64))
     }
 
-    /// The number one level of a list starts at: the list's override, else the definition's.
+    /// The definition (`abstractNumId`) whose counters a list advances.
+    fn counted_by(&self, num_id: i64) -> Option<i64> {
+        self.num_to_abstract.get(&num_id).copied()
+    }
+
+    /// The number a level's count begins at: the shared definition's `w:start`. Word does not
+    /// begin a list at its own override's `w:start` unless a `w:startOverride` restarts it.
     fn start(&self, num_id: i64, level: usize) -> i64 {
-        self.start_overrides
-            .get(&(num_id, level as i64))
-            .copied()
-            .or_else(|| self.definition(num_id, level).map(|definition| definition.start))
+        self.shared_definition(num_id, level)
+            .and_then(|definition| definition.start)
             .unwrap_or(0)
+    }
+
+    /// Where a list's `w:startOverride` restarts its count: at the override level's own
+    /// `w:start` if it writes one, as Word does, else at the `w:startOverride` value.
+    fn restart(&self, num_id: i64, level: usize) -> Option<i64> {
+        let key = (num_id, level as i64);
+        let start_override = *self.start_overrides.get(&key)?;
+        let own_start = self.level_overrides.get(&key).and_then(|definition| definition.start);
+        Some(own_start.unwrap_or(start_override))
+    }
+
+    /// Whether each list's levels are bullets or numbered.
+    fn list_types(&self) -> AHashMap<(i64, i64), ListType> {
+        let mut list_types = AHashMap::new();
+        for num_id in self.num_to_abstract.keys() {
+            for lvl in 0..LIST_LEVELS {
+                if let Some(list_type) = self.definition(*num_id, lvl).and_then(level_list_type) {
+                    list_types.insert((*num_id, lvl as i64), list_type);
+                }
+            }
+        }
+        list_types
     }
 }
 
@@ -444,12 +482,24 @@ impl NumberingReader {
                 }
             }
             name if LEVEL_LABEL_PROPERTIES.contains(&name) => {
-                if let (Some(abstract_id), Some(lvl)) = (self.abstract_num_id, self.lvl) {
-                    let level = self.levels.definitions.entry((abstract_id, lvl)).or_default();
+                if let Some(level) = self.current_level() {
                     read_level_label_property(e, level);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The level definition being read: a `w:abstractNum/w:lvl`, or a list's own
+    /// `w:num/w:lvlOverride/w:lvl`, kept under the level it overrides.
+    fn current_level(&mut self) -> Option<&mut NumberingLevel> {
+        let lvl = self.lvl?;
+        match (self.abstract_num_id, self.num_id, self.override_lvl) {
+            (Some(abstract_id), _, _) => Some(self.levels.definitions.entry((abstract_id, lvl)).or_default()),
+            (None, Some(num_id), Some(overridden)) => {
+                Some(self.levels.level_overrides.entry((num_id, overridden)).or_default())
+            }
+            _ => None,
         }
     }
 
@@ -468,21 +518,8 @@ impl NumberingReader {
 
     /// Whether each list's levels are bullets or numbered, beside the definitions themselves.
     fn finish(self) -> Numbering {
-        let mut list_types = AHashMap::new();
-        for (num_id, abstract_id) in &self.levels.num_to_abstract {
-            for lvl in 0..LIST_LEVELS as i64 {
-                let list_type = self
-                    .levels
-                    .definitions
-                    .get(&(*abstract_id, lvl))
-                    .and_then(level_list_type);
-                if let Some(list_type) = list_type {
-                    list_types.insert((*num_id, lvl), list_type);
-                }
-            }
-        }
         Numbering {
-            list_types,
+            list_types: self.levels.list_types(),
             levels: self.levels,
         }
     }
@@ -509,7 +546,7 @@ const LEVEL_LABEL_PROPERTIES: [&str; 5] = ["w:numFmt", "w:start", "w:lvlText", "
 fn read_level_label_property(e: &BytesStart, level: &mut NumberingLevel) {
     match e.name().as_ref() {
         "w:numFmt" => level.num_fmt = get_val_attr_string(e),
-        "w:start" => level.start = get_val_attr(e).unwrap_or(0),
+        "w:start" => level.start = get_val_attr(e),
         "w:lvlText" => {
             level.lvl_text = get_val_attr_string(e).map(|text| match quick_xml::escape::unescape(&text) {
                 Ok(unescaped) => unescaped.into_owned(),
@@ -591,14 +628,27 @@ const LIST_LEVELS: usize = MAX_LIST_NESTING_LEVEL as usize + 1;
 /// The counter of each level of one list; `None` for a level not used since it last restarted.
 type ListCounters = [Option<i64>; LIST_LEVELS];
 
+/// The counts Word keeps while it numbers the main story.
+#[derive(Debug, Default)]
+struct ListCounting {
+    /// The counters of each list definition (`abstractNumId`), shared by every list using it.
+    by_definition: AHashMap<i64, ListCounters>,
+    /// The `(numId, level)` pairs already numbered, so a `w:startOverride` restarts only once.
+    used: ahash::AHashSet<(i64, usize)>,
+}
+
 /// Paint the label Word shows before every numbered paragraph of the main story.
 ///
-/// Word keeps a counter for each level of each list (`numId`). A numbered paragraph advances
-/// its level's counter, starting it at `w:start` the first time, and restarts the deeper
-/// levels that `w:lvlRestart` ties to it. The label is the level's `w:lvlText` with each `%N`
-/// replaced by level N's counter in level N's format. Paragraphs in table cells are in the
-/// same sequence, as Word numbers them in reading order with the rest of the body; only the
-/// body's labels are kept, as no list item is built from a cell paragraph.
+/// Word keeps a counter for each level of each list definition (`abstractNumId`), and every
+/// list (`numId`) that uses the definition advances the same counters, so a second list
+/// carries on from the first. A list's `w:startOverride` restarts the count, once, at the
+/// list's first paragraph on that level. A numbered paragraph advances its level's counter,
+/// starting it at `w:start` the first time, and restarts the deeper levels that `w:lvlRestart`
+/// ties to it. The label is the level's `w:lvlText`, from the list's own `w:lvlOverride` when
+/// it has one, with each `%N` replaced by level N's counter in level N's format. Paragraphs in
+/// table cells are in the same sequence, as Word numbers them in reading order with the rest
+/// of the body; only the body's labels are kept, as no list item is built from a cell
+/// paragraph.
 fn assign_list_labels(document: &mut Document, budget: &mut SecurityBudget) -> Result<(), DocxParseError> {
     let Document {
         elements,
@@ -609,9 +659,9 @@ fn assign_list_labels(document: &mut Document, budget: &mut SecurityBudget) -> R
         list_labels,
         ..
     } = document;
-    let mut counters: AHashMap<i64, ListCounters> = AHashMap::new();
+    let mut counting = ListCounting::default();
     let mut label = |paragraph: &Paragraph| {
-        label_list_paragraph(paragraph, numbering_defs, numbering_levels, &mut counters, budget)
+        label_list_paragraph(paragraph, numbering_defs, numbering_levels, &mut counting, budget)
     };
     for element in elements.iter() {
         match *element {
@@ -646,15 +696,29 @@ fn label_list_paragraph(
     paragraph: &Paragraph,
     list_types: &AHashMap<(i64, i64), ListType>,
     levels: &NumberingLevels,
-    counters: &mut AHashMap<i64, ListCounters>,
+    counting: &mut ListCounting,
     budget: &mut SecurityBudget,
 ) -> Result<Option<String>, SecurityError> {
     let (Some(num_id), Some(level)) = (paragraph.numbering_id, paragraph.numbering_level) else {
         return Ok(None);
     };
+    let Some(definition_id) = levels.counted_by(num_id) else {
+        return Ok(None);
+    };
     let level = clamp_numbering_level(level) as usize;
-    let list = counters.entry(num_id).or_insert([None; LIST_LEVELS]);
-    list[level] = Some(list[level].map_or_else(|| levels.start(num_id, level), |count| count.saturating_add(1)));
+    let restart = if counting.used.insert((num_id, level)) {
+        levels.restart(num_id, level)
+    } else {
+        None
+    };
+    let list = counting
+        .by_definition
+        .entry(definition_id)
+        .or_insert([None; LIST_LEVELS]);
+    list[level] = Some(match restart {
+        Some(value) => value,
+        None => list[level].map_or_else(|| levels.start(num_id, level), |count| count.saturating_add(1)),
+    });
     for (deeper, counter) in list.iter_mut().enumerate().skip(level + 1) {
         let restart = levels
             .definition(num_id, deeper)
@@ -4612,7 +4676,7 @@ mod tests {
 
     fn numbered_level(num_fmt: &str, lvl_text: &str) -> NumberingLevel {
         NumberingLevel {
-            start: 1,
+            start: Some(1),
             num_fmt: Some(num_fmt.to_string()),
             lvl_text: Some(lvl_text.to_string()),
             ..Default::default()
@@ -4637,7 +4701,7 @@ mod tests {
     /// The labels of list 1's paragraphs at `sequence`'s levels, in order.
     fn list_labels(definitions: Vec<NumberingLevel>, sequence: &[i64]) -> Vec<Option<String>> {
         let (list_types, levels) = list_of_levels(definitions);
-        let mut counters = AHashMap::new();
+        let mut counting = ListCounting::default();
         let mut budget = SecurityBudget::with_defaults();
         sequence
             .iter()
@@ -4645,7 +4709,7 @@ mod tests {
                 let mut paragraph = Paragraph::new();
                 paragraph.numbering_id = Some(1);
                 paragraph.numbering_level = Some(*level);
-                label_list_paragraph(&paragraph, &list_types, &levels, &mut counters, &mut budget).unwrap()
+                label_list_paragraph(&paragraph, &list_types, &levels, &mut counting, &mut budget).unwrap()
             })
             .collect()
     }
@@ -4745,7 +4809,7 @@ mod tests {
     #[test]
     fn test_list_label_starts_at_zero_without_a_start() {
         let mut first = numbered_level("decimal", "%1.");
-        first.start = 0;
+        first.start = None;
         assert_eq!(list_labels(vec![first], &[0, 0]), some_labels(&["0.", "1."]));
     }
 
@@ -4787,7 +4851,7 @@ mod tests {
 
     #[test]
     fn test_numbering_reads_what_a_list_label_needs() {
-        let xml = r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="2"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="&#40;%1&#41;"/></w:lvl><w:lvl w:ilvl="1"><w:lvlRestart w:val="0"/><w:isLgl/><w:lvlText w:val="%1.%2"/></w:lvl><w:lvl w:ilvl="2"><w:start w:val="1"/></w:lvl><w:lvl w:ilvl="9"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="5"/></w:lvlOverride></w:num></w:numbering>"#;
+        let xml = r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="2"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="&#40;%1&#41;"/></w:lvl><w:lvl w:ilvl="1"><w:lvlRestart w:val="0"/><w:isLgl/><w:lvlText w:val="%1.%2"/></w:lvl><w:lvl w:ilvl="2"><w:start w:val="1"/></w:lvl><w:lvl w:ilvl="9"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="5"/></w:lvlOverride></w:num><w:num w:numId="3"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:lvl w:ilvl="0"><w:start w:val="4"/><w:lvlText w:val="%1)"/></w:lvl></w:lvlOverride></w:num></w:numbering>"#;
         let parser = DocxParser {
             archive: zip::ZipArchive::new(std::io::Cursor::new(create_minimal_zip())).unwrap(),
             relationships: AHashMap::new(),
@@ -4801,7 +4865,7 @@ mod tests {
         assert_eq!(
             levels.definition(1, 0),
             Some(&NumberingLevel {
-                start: 2,
+                start: Some(2),
                 num_fmt: Some("lowerLetter".to_string()),
                 lvl_text: Some("(%1)".to_string()),
                 restart: None,
@@ -4811,16 +4875,33 @@ mod tests {
         assert_eq!(
             levels.definition(1, 1),
             Some(&NumberingLevel {
-                start: 0,
+                start: None,
                 num_fmt: None,
                 lvl_text: Some("%1.%2".to_string()),
                 restart: Some(0),
                 is_legal: true,
             })
         );
-        // Both lists read the one definition; the second restarts it at 5. ~keep
+        // Both lists read the one definition and begin at its start; the second restarts it
+        // at 5 where it is first used. ~keep
         assert_eq!(levels.definition(2, 0), levels.definition(1, 0));
-        assert_eq!((levels.start(1, 0), levels.start(2, 0)), (2, 5));
+        assert_eq!((levels.start(1, 0), levels.start(2, 0)), (2, 2));
+        assert_eq!((levels.restart(1, 0), levels.restart(2, 0)), (None, Some(5)));
+        // The third list paints level 0 from its own `w:lvlOverride/w:lvl`, and level 1 from
+        // the shared definition. ~keep
+        assert_eq!(
+            levels.definition(3, 0),
+            Some(&NumberingLevel {
+                start: Some(4),
+                num_fmt: None,
+                lvl_text: Some("%1)".to_string()),
+                restart: None,
+                is_legal: false,
+            })
+        );
+        assert_eq!(levels.definition(3, 1), levels.definition(1, 1));
+        assert_eq!(levels.shared_definition(3, 0), levels.definition(1, 0));
+        assert_eq!(numbering.list_types.get(&(3, 0)), Some(&ListType::Numbered));
         // Word has no level 9, so none is kept. ~keep
         assert_eq!(levels.definitions.len(), 3);
         assert_eq!(numbering.list_types.get(&(1, 0)), Some(&ListType::Numbered));
@@ -4828,6 +4909,91 @@ mod tests {
         // no `w:lvlText` either, so Word shows no number for it and none is counted. ~keep
         assert_eq!(numbering.list_types.get(&(1, 1)), Some(&ListType::Numbered));
         assert_eq!(numbering.list_types.get(&(1, 2)), None);
+    }
+
+    /// `word/numbering.xml` holding `body`, as the parser reads it.
+    fn numbering_of(body: &str) -> Numbering {
+        let xml = format!(
+            r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{body}</w:numbering>"#
+        );
+        let parser = DocxParser {
+            archive: zip::ZipArchive::new(std::io::Cursor::new(create_minimal_zip())).unwrap(),
+            relationships: AHashMap::new(),
+            styles: None,
+            theme: None,
+        };
+        parser
+            .parse_numbering(&xml, &mut SecurityBudget::with_defaults())
+            .unwrap()
+    }
+
+    /// The labels of paragraphs at `sequence`'s `(numId, ilvl)`, in order.
+    fn labels_in_order(numbering: &Numbering, sequence: &[(i64, i64)]) -> Vec<Option<String>> {
+        let mut counting = ListCounting::default();
+        let mut budget = SecurityBudget::with_defaults();
+        sequence
+            .iter()
+            .map(|&(num_id, level)| {
+                let mut paragraph = Paragraph::new();
+                paragraph.numbering_id = Some(num_id);
+                paragraph.numbering_level = Some(level);
+                label_list_paragraph(
+                    &paragraph,
+                    &numbering.list_types,
+                    &numbering.levels,
+                    &mut counting,
+                    &mut budget,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// A definition with a decimal level 0 and a lettered level 1.
+    const SHARED_DEFINITION: &str = r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2)"/></w:lvl></w:abstractNum>"#;
+
+    /// Lists that use one definition share its count, as Word paints them: a second list
+    /// carries on from the first, and a `w:startOverride` restarts the count once, where its
+    /// list is first used.
+    #[test]
+    fn test_lists_sharing_a_definition_share_its_count() {
+        let numbering = numbering_of(&format!(
+            r#"{SHARED_DEFINITION}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="3"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride></w:num>"#
+        ));
+        assert_eq!(
+            labels_in_order(
+                &numbering,
+                &[(1, 0), (2, 0), (2, 1), (3, 0), (3, 0), (1, 0), (1, 1), (3, 0)]
+            ),
+            some_labels(&["1.", "2.", "a)", "1.", "2.", "3.", "a)", "4."])
+        );
+    }
+
+    /// A list's own level definition changes how the level is written, not its count: the
+    /// override's roman numbers and the shared letters advance one counter.
+    #[test]
+    fn test_a_level_override_paints_its_own_format_on_the_shared_count() {
+        let numbering = numbering_of(&format!(
+            r#"{SHARED_DEFINITION}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="1"><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerRoman"/><w:lvlText w:val="%2."/></w:lvl></w:lvlOverride></w:num>"#
+        ));
+        assert_eq!(
+            labels_in_order(&numbering, &[(1, 0), (2, 0), (2, 1), (2, 1), (1, 1)]),
+            some_labels(&["1.", "2.", "i.", "ii.", "c)"])
+        );
+    }
+
+    /// An override's `w:start` takes effect only where a `w:startOverride` restarts its list:
+    /// the restart begins at that `w:start`, or at the `w:startOverride` value when the
+    /// override writes none.
+    #[test]
+    fn test_a_level_override_starts_only_where_a_start_override_restarts_it() {
+        let numbering = numbering_of(&format!(
+            r#"{SHARED_DEFINITION}<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:lvl w:ilvl="0"><w:start w:val="4"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1)"/></w:lvl></w:lvlOverride></w:num><w:num w:numId="3"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="7"/><w:lvl w:ilvl="0"><w:start w:val="4"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1)"/></w:lvl></w:lvlOverride></w:num><w:num w:numId="4"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="7"/><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="(%1)"/></w:lvl></w:lvlOverride></w:num>"#
+        ));
+        assert_eq!(
+            labels_in_order(&numbering, &[(2, 0), (2, 0), (1, 0), (3, 0), (4, 0), (4, 0)]),
+            some_labels(&["1)", "2)", "3.", "d)", "(7)", "(8)"])
+        );
     }
 
     #[test]

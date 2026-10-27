@@ -19,7 +19,8 @@ const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main
 /// List 1 numbers exam questions (`Q%1.`, then `(%2)`). Lists 2 and 3 share a clause definition
 /// that starts at 3 and whose third level never restarts; list 3 restarts it at 10. List 4 is a
 /// plain `1.`, `2.` list, and list 5 a bullet list with a numbered second level. List 6 numbers
-/// questions from 3 without writing a `w:numFmt`.
+/// questions from 3 without writing a `w:numFmt`. Lists 7 and 8 share a plain definition, and
+/// only list 8 overrides its level, with its own `%1)` and a restart at 4.
 const NUMBERING_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:abstractNum w:abstractNumId="0">
@@ -41,12 +42,17 @@ const NUMBERING_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="
   <w:abstractNum w:abstractNumId="4">
     <w:lvl w:ilvl="0"><w:start w:val="3"/><w:lvlText w:val="Q%1."/></w:lvl>
   </w:abstractNum>
+  <w:abstractNum w:abstractNumId="5">
+    <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+  </w:abstractNum>
   <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
   <w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
   <w:num w:numId="3"><w:abstractNumId w:val="1"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="10"/></w:lvlOverride></w:num>
   <w:num w:numId="4"><w:abstractNumId w:val="2"/></w:num>
   <w:num w:numId="5"><w:abstractNumId w:val="3"/></w:num>
   <w:num w:numId="6"><w:abstractNumId w:val="4"/></w:num>
+  <w:num w:numId="7"><w:abstractNumId w:val="5"/></w:num>
+  <w:num w:numId="8"><w:abstractNumId w:val="5"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/><w:lvl w:ilvl="0"><w:start w:val="4"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1)"/></w:lvl></w:lvlOverride></w:num>
 </w:numbering>"#;
 
 /// Build a minimal `.docx` with `body_xml` and [`NUMBERING_XML`].
@@ -214,6 +220,39 @@ fn a_level_without_a_number_format_is_numbered_in_decimal() {
         doc.content
     );
     for line in ["- Q3. Define speed.", "- Q4. Define velocity."] {
+        assert!(doc.content.contains(line), "missing {line:?} in:\n{}", doc.content);
+    }
+}
+
+/// Two lists share one definition and only the second overrides its level. Word paints the
+/// override's `%1)` from its restart at 4, and keeps one count for both lists, so the first
+/// list carries on at 6.
+#[test]
+fn two_lists_sharing_a_definition_keep_one_count_and_their_own_levels() {
+    let body = [
+        list_item(7, 0, "First."),
+        list_item(7, 0, "Second."),
+        list_item(8, 0, "Restarted."),
+        list_item(8, 0, "Next."),
+        list_item(7, 0, "Carried on."),
+    ]
+    .concat();
+
+    let doc = extract(&body);
+
+    assert_eq!(
+        list_markers(&doc),
+        vec![
+            None,
+            None,
+            Some("4)".to_string()),
+            Some("5)".to_string()),
+            Some("6.".to_string())
+        ],
+        "content:\n{}",
+        doc.content
+    );
+    for line in ["1. First.\n2. Second.", "- 6\\. Carried on."] {
         assert!(doc.content.contains(line), "missing {line:?} in:\n{}", doc.content);
     }
 }
