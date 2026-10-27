@@ -54,6 +54,12 @@ pub(crate) struct Document {
     pub numbering_defs: AHashMap<(i64, i64), ListType>,
     /// The level definitions each list paints its labels from.
     pub(crate) numbering_levels: NumberingLevels,
+    /// The label Word paints before each numbered body paragraph, such as `3.`, `(b)` or `Q4.`,
+    /// by index into `paragraphs`.
+    ///
+    /// Kept here rather than on [`Paragraph`]: that struct is public and exhaustive, so a new
+    /// field would break every caller that builds one field by field.
+    pub(crate) list_labels: AHashMap<usize, String>,
     /// Document elements in their original order.
     pub elements: Vec<DocumentElement>,
     /// Parsed style catalog from `word/styles.xml`, if available.
@@ -87,12 +93,6 @@ pub struct Paragraph {
     pub numbering_id: Option<i64>,
     /// Indentation level within the numbering definition (0-based).
     pub numbering_level: Option<i64>,
-    /// The label Word paints before this numbered paragraph, such as `3.`, `(b)` or `Q4.`.
-    ///
-    /// `None` for a bullet, for a paragraph outside the main story, and for a level whose
-    /// number format has no label written here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub list_label: Option<String>,
     /// Bookmark names (`w:bookmarkStart/@w:name`) that start inside this paragraph.
     ///
     /// A generated table of contents links each entry to the `_Toc…` bookmark Word
@@ -585,7 +585,8 @@ type ListCounters = [Option<i64>; LIST_LEVELS];
 /// its level's counter, starting it at `w:start` the first time, and restarts the deeper
 /// levels that `w:lvlRestart` ties to it. The label is the level's `w:lvlText` with each `%N`
 /// replaced by level N's counter in level N's format. Paragraphs in table cells are in the
-/// same sequence, as Word numbers them in reading order with the rest of the body.
+/// same sequence, as Word numbers them in reading order with the rest of the body; only the
+/// body's labels are kept, as no list item is built from a cell paragraph.
 fn assign_list_labels(document: &mut Document, budget: &mut SecurityBudget) -> Result<(), DocxParseError> {
     let Document {
         elements,
@@ -593,28 +594,31 @@ fn assign_list_labels(document: &mut Document, budget: &mut SecurityBudget) -> R
         tables,
         numbering_defs,
         numbering_levels,
+        list_labels,
         ..
     } = document;
     let mut counters: AHashMap<i64, ListCounters> = AHashMap::new();
-    let mut label = |paragraph: &mut Paragraph| {
+    let mut label = |paragraph: &Paragraph| {
         label_list_paragraph(paragraph, numbering_defs, numbering_levels, &mut counters, budget)
     };
     for element in elements.iter() {
         match *element {
             DocumentElement::Paragraph(index) => {
-                if let Some(paragraph) = paragraphs.get_mut(index) {
-                    label(paragraph)?;
+                if let Some(paragraph) = paragraphs.get(index)
+                    && let Some(painted) = label(paragraph)?
+                {
+                    list_labels.insert(index, painted);
                 }
             }
             DocumentElement::Table(index) => {
-                let Some(table) = tables.get_mut(index) else {
+                let Some(table) = tables.get(index) else {
                     continue;
                 };
                 for paragraph in table
                     .rows
-                    .iter_mut()
-                    .flat_map(|row| row.cells.iter_mut())
-                    .flat_map(|cell| cell.paragraphs.iter_mut())
+                    .iter()
+                    .flat_map(|row| row.cells.iter())
+                    .flat_map(|cell| cell.paragraphs.iter())
                 {
                     label(paragraph)?;
                 }
@@ -627,14 +631,14 @@ fn assign_list_labels(document: &mut Document, budget: &mut SecurityBudget) -> R
 
 /// Advance the counters for one paragraph and paint its label if its level is numbered.
 fn label_list_paragraph(
-    paragraph: &mut Paragraph,
+    paragraph: &Paragraph,
     list_types: &AHashMap<(i64, i64), ListType>,
     levels: &NumberingLevels,
     counters: &mut AHashMap<i64, ListCounters>,
     budget: &mut SecurityBudget,
-) -> Result<(), SecurityError> {
+) -> Result<Option<String>, SecurityError> {
     let (Some(num_id), Some(level)) = (paragraph.numbering_id, paragraph.numbering_level) else {
-        return Ok(());
+        return Ok(None);
     };
     let level = clamp_numbering_level(level) as usize;
     let list = counters.entry(num_id).or_insert([None; LIST_LEVELS]);
@@ -660,9 +664,9 @@ fn label_list_paragraph(
         // The label is text the file does not hold: a long `w:lvlText` repeats on every
         // paragraph of its list, so it counts against the content limit like the text. ~keep
         budget.account_text(label.len())?;
-        paragraph.list_label = Some(label);
+        return Ok(Some(label));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// A list label as Markdown text after a bullet. `3.` and `3)` are escaped, as the renderers
@@ -1000,10 +1004,7 @@ impl Document {
             for element in &self.elements {
                 match element {
                     DocumentElement::Paragraph(idx) => {
-                        let Some(paragraph) = self.paragraphs.get(*idx) else {
-                            continue;
-                        };
-                        self.append_paragraph_markdown(paragraph, &mut output, &mut list_counters, &mut prev_was_list);
+                        self.append_paragraph_markdown(*idx, &mut output, &mut list_counters, &mut prev_was_list);
                     }
                     DocumentElement::Table(idx) => {
                         let Some(table) = self.tables.get(*idx) else { continue };
@@ -1042,8 +1043,8 @@ impl Document {
                 }
             }
         } else {
-            for paragraph in &self.paragraphs {
-                self.append_paragraph_markdown(paragraph, &mut output, &mut list_counters, &mut prev_was_list);
+            for index in 0..self.paragraphs.len() {
+                self.append_paragraph_markdown(index, &mut output, &mut list_counters, &mut prev_was_list);
             }
         }
 
@@ -1186,14 +1187,18 @@ impl Document {
         output
     }
 
-    /// Helper: append a paragraph's markdown to output, managing list transitions.
+    /// Helper: append the markdown of the body paragraph at `index` to output, managing list
+    /// transitions.
     fn append_paragraph_markdown(
         &self,
-        paragraph: &Paragraph,
+        index: usize,
         output: &mut String,
         list_counters: &mut AHashMap<(i64, i64), usize>,
         prev_was_list: &mut bool,
     ) {
+        let Some(paragraph) = self.paragraphs.get(index) else {
+            return;
+        };
         let is_list = paragraph.numbering_id.is_some();
 
         if is_list && !*prev_was_list {
@@ -1205,7 +1210,8 @@ impl Document {
         }
 
         let heading_level = paragraph.style.as_deref().and_then(|s| self.resolve_heading_level(s));
-        let md = paragraph.to_markdown(&self.numbering_defs, list_counters, heading_level);
+        let list_label = self.list_labels.get(&index).map(String::as_str);
+        let md = paragraph.to_markdown(&self.numbering_defs, list_counters, heading_level, list_label);
         if md.is_empty() {
             *prev_was_list = is_list;
             return;
@@ -1398,12 +1404,14 @@ impl Paragraph {
     /// Render as markdown with heading/list context.
     ///
     /// If `heading_level` is provided (resolved via `Document::resolve_heading_level`),
-    /// it takes precedence over style name matching.
+    /// it takes precedence over style name matching. `list_label` is the label Word paints
+    /// before this paragraph, from [`Document::list_labels`].
     pub(crate) fn to_markdown(
         &self,
         numbering_defs: &AHashMap<(i64, i64), ListType>,
         list_counters: &mut AHashMap<(i64, i64), usize>,
         heading_level: Option<u8>,
+        list_label: Option<&str>,
     ) -> String {
         let inline = self.runs_to_markdown();
 
@@ -1427,8 +1435,8 @@ impl Paragraph {
                     // Word's own label is written as text on a bullet, as the renderers write a
                     // list item's source label: CommonMark cannot number with `(b)` or `Q4.`.
                     // A plain `N.` on the Nth item reads the same as a numbered list item. ~keep
-                    if let Some(label) = &self.list_label
-                        && *label != format!("{}.", *counter)
+                    if let Some(label) = list_label
+                        && label != format!("{}.", *counter)
                     {
                         return format!("{}- {} {}", indent, markdown_list_label(label), inline);
                     }
@@ -4437,7 +4445,7 @@ mod tests {
         para.add_run(Run::new("My Title".to_string()));
         let defs = AHashMap::new();
         let mut counters = AHashMap::new();
-        assert_eq!(para.to_markdown(&defs, &mut counters, Some(1)), "# My Title");
+        assert_eq!(para.to_markdown(&defs, &mut counters, Some(1), None), "# My Title");
     }
 
     #[test]
@@ -4447,7 +4455,7 @@ mod tests {
         para.add_run(Run::new("Section".to_string()));
         let defs = AHashMap::new();
         let mut counters = AHashMap::new();
-        assert_eq!(para.to_markdown(&defs, &mut counters, Some(2)), "## Section");
+        assert_eq!(para.to_markdown(&defs, &mut counters, Some(2), None), "## Section");
     }
 
     #[test]
@@ -4457,7 +4465,7 @@ mod tests {
         para.add_run(Run::new("Subsection".to_string()));
         let defs = AHashMap::new();
         let mut counters = AHashMap::new();
-        assert_eq!(para.to_markdown(&defs, &mut counters, Some(3)), "### Subsection");
+        assert_eq!(para.to_markdown(&defs, &mut counters, Some(3), None), "### Subsection");
     }
 
     #[test]
@@ -4469,7 +4477,7 @@ mod tests {
         let mut defs = AHashMap::new();
         defs.insert((1, 0), ListType::Bullet);
         let mut counters = AHashMap::new();
-        assert_eq!(para.to_markdown(&defs, &mut counters, None), "- Item");
+        assert_eq!(para.to_markdown(&defs, &mut counters, None, None), "- Item");
     }
 
     #[test]
@@ -4481,7 +4489,7 @@ mod tests {
         let mut defs = AHashMap::new();
         defs.insert((2, 0), ListType::Numbered);
         let mut counters = AHashMap::new();
-        assert_eq!(para.to_markdown(&defs, &mut counters, None), "1. Item");
+        assert_eq!(para.to_markdown(&defs, &mut counters, None, None), "1. Item");
     }
 
     /// Only `bullet` and `none` are not numbered. The CJK, enclosed, ordinal and other
@@ -4560,7 +4568,7 @@ mod tests {
         let mut defs = AHashMap::new();
         defs.insert((1, 1), ListType::Bullet);
         let mut counters = AHashMap::new();
-        assert_eq!(para.to_markdown(&defs, &mut counters, None), "  - Nested");
+        assert_eq!(para.to_markdown(&defs, &mut counters, None, None), "  - Nested");
     }
 
     #[test]
@@ -4582,8 +4590,11 @@ mod tests {
             ("(b)", "- (b) Scope."),
             ("Q4.", "- Q4. Scope."),
         ] {
-            para.list_label = Some(label.to_string());
-            assert_eq!(para.to_markdown(&defs, &mut counters, None), expected, "label {label}");
+            assert_eq!(
+                para.to_markdown(&defs, &mut counters, None, Some(label)),
+                expected,
+                "label {label}"
+            );
         }
     }
 
@@ -4620,8 +4631,7 @@ mod tests {
                 let mut paragraph = Paragraph::new();
                 paragraph.numbering_id = Some(1);
                 paragraph.numbering_level = Some(*level);
-                label_list_paragraph(&mut paragraph, &list_types, &levels, &mut counters, &mut budget).unwrap();
-                paragraph.list_label
+                label_list_paragraph(&paragraph, &list_types, &levels, &mut counters, &mut budget).unwrap()
             })
             .collect()
     }

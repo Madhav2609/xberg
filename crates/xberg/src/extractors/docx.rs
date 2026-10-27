@@ -230,7 +230,7 @@ fn build_internal_document(
                             Some(current_page),
                             None,
                         );
-                        if let Some(label) = &paragraph.list_label {
+                        if let Some(label) = doc.list_labels.get(idx) {
                             word_list_labels.insert(li_idx, label.as_str());
                         }
                         Some(li_idx)
