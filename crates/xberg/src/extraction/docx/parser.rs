@@ -465,7 +465,7 @@ struct NumberingReader {
 
 impl NumberingReader {
     /// An element's start tag, or the whole of an empty one.
-    fn element(&mut self, e: &BytesStart, is_start: bool) {
+    fn element(&mut self, e: &BytesStart, is_start: bool, budget: &SecurityBudget) -> Result<(), SecurityError> {
         match e.name().as_ref() {
             "w:abstractNum" if is_start => self.abstract_num_id = get_attr_i64(e, "w:abstractNumId"),
             "w:num" if is_start => self.num_id = get_attr_i64(e, "w:numId"),
@@ -483,11 +483,12 @@ impl NumberingReader {
             }
             name if LEVEL_LABEL_PROPERTIES.contains(&name) => {
                 if let Some(level) = self.current_level() {
-                    read_level_label_property(e, level);
+                    read_level_label_property(e, level, budget)?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// The level definition being read: a `w:abstractNum/w:lvl`, or a list's own
@@ -543,12 +544,19 @@ fn get_attr_i64(e: &BytesStart, key: &str) -> Option<i64> {
 const LEVEL_LABEL_PROPERTIES: [&str; 5] = ["w:numFmt", "w:start", "w:lvlText", "w:lvlRestart", "w:isLgl"];
 
 /// Read one of [`LEVEL_LABEL_PROPERTIES`] into `level`.
-fn read_level_label_property(e: &BytesStart, level: &mut NumberingLevel) {
+///
+/// The two strings kept with a level, its format and its template, are held to the entity
+/// limit before they are copied: a `w:lvlText` is painted again on every paragraph of its list.
+fn read_level_label_property(
+    e: &BytesStart,
+    level: &mut NumberingLevel,
+    budget: &SecurityBudget,
+) -> Result<(), SecurityError> {
     match e.name().as_ref() {
-        "w:numFmt" => level.num_fmt = get_val_attr_string(e),
+        "w:numFmt" => level.num_fmt = bounded_val_attr_string(e, budget)?,
         "w:start" => level.start = get_val_attr(e),
         "w:lvlText" => {
-            level.lvl_text = get_val_attr_string(e).map(|text| match quick_xml::escape::unescape(&text) {
+            level.lvl_text = bounded_val_attr_string(e, budget)?.map(|text| match quick_xml::escape::unescape(&text) {
                 Ok(unescaped) => unescaped.into_owned(),
                 Err(_) => text,
             });
@@ -557,6 +565,20 @@ fn read_level_label_property(e: &BytesStart, level: &mut NumberingLevel) {
         "w:isLgl" => level.is_legal = is_format_enabled(e),
         _ => {}
     }
+    Ok(())
+}
+
+/// Read `w:val` as a String, refused before it is copied when it is longer than an entity
+/// may be.
+fn bounded_val_attr_string(e: &BytesStart, budget: &SecurityBudget) -> Result<Option<String>, SecurityError> {
+    for attr in e.attributes().flatten() {
+        if attr.key.as_ref() == "w:val" {
+            let value = attr.value.as_ref();
+            budget.check_entity(value)?;
+            return Ok(Some(value.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// A counter written in a `w:numFmt` format, or `None` for a format no label is painted in here.
@@ -734,15 +756,10 @@ fn label_list_paragraph(
             *counter = None;
         }
     }
-    if list_types.get(&(num_id, level as i64)) == Some(&ListType::Numbered)
-        && let Some(label) = paint_list_label(num_id, level, list, levels)
-    {
-        // The label is text the file does not hold: a long `w:lvlText` repeats on every
-        // paragraph of its list, so it counts against the content limit like the text. ~keep
-        budget.account_text(label.len())?;
-        return Ok(Some(label));
+    if list_types.get(&(num_id, level as i64)) != Some(&ListType::Numbered) {
+        return Ok(None);
     }
-    Ok(None)
+    paint_list_label(num_id, level, list, levels, budget)
 }
 
 /// A list label as Markdown text after a bullet. `3.` and `3)` are escaped, as the renderers
@@ -759,9 +776,25 @@ fn markdown_list_label(label: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Fill a level's `w:lvlText` with the list's counters, or `None` when it has no label to show.
-fn paint_list_label(num_id: i64, level: usize, list: &ListCounters, levels: &NumberingLevels) -> Option<String> {
-    let definition = levels.definition(num_id, level)?;
-    let template = definition.lvl_text.as_deref()?;
+///
+/// The label is text the file does not hold: its template repeats on every paragraph of the
+/// list, and each `%N` can grow to 32 letters. So every piece counts against the content limit
+/// before it is appended, and a label that would pass the limit stops there rather than being
+/// painted in full first. A label abandoned part-way, for a format it cannot be written in,
+/// keeps the pieces it charged: the limit may count bytes never written, never fewer.
+fn paint_list_label(
+    num_id: i64,
+    level: usize,
+    list: &ListCounters,
+    levels: &NumberingLevels,
+    budget: &mut SecurityBudget,
+) -> Result<Option<String>, SecurityError> {
+    let Some(definition) = levels.definition(num_id, level) else {
+        return Ok(None);
+    };
+    let Some(template) = definition.lvl_text.as_deref() else {
+        return Ok(None);
+    };
     let mut label = String::new();
     let mut chars = template.chars().peekable();
     while let Some(character) = chars.next() {
@@ -770,6 +803,7 @@ fn paint_list_label(num_id: i64, level: usize, list: &ListCounters, levels: &Num
             .and_then(|next| next.to_digit(10))
             .filter(|digit| *digit >= 1);
         let (Some(digit), '%') = (placeholder, character) else {
+            budget.account_text(character.len_utf8())?;
             label.push(character);
             continue;
         };
@@ -787,10 +821,14 @@ fn paint_list_label(num_id: i64, level: usize, list: &ListCounters, levels: &Num
                 .definition(num_id, at)
                 .and_then(|definition| definition.num_fmt.as_deref())
         };
-        label.push_str(&format_list_counter(value, num_fmt)?);
+        let Some(counter) = format_list_counter(value, num_fmt) else {
+            return Ok(None);
+        };
+        budget.account_text(counter.len())?;
+        label.push_str(&counter);
     }
     let label = label.trim();
-    (!label.is_empty()).then(|| label.to_string())
+    Ok((!label.is_empty()).then(|| label.to_string()))
 }
 
 /// Extract the target URL from a `HYPERLINK` field instruction (#88, #239).
@@ -3990,9 +4028,9 @@ impl<R: Read + Seek> DocxParser<R> {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) => {
                     budget.enter()?;
-                    numbering.element(e, true);
+                    numbering.element(e, true, budget)?;
                 }
-                Ok(Event::Empty(ref e)) => numbering.element(e, false),
+                Ok(Event::Empty(ref e)) => numbering.element(e, false, budget)?,
                 Ok(Event::End(ref e)) => {
                     budget.leave();
                     numbering.end(e.name().as_ref());
@@ -4911,8 +4949,8 @@ mod tests {
         assert_eq!(numbering.list_types.get(&(1, 2)), None);
     }
 
-    /// `word/numbering.xml` holding `body`, as the parser reads it.
-    fn numbering_of(body: &str) -> Numbering {
+    /// `word/numbering.xml` holding `body`, read under `limits`.
+    fn parse_numbering_with(body: &str, limits: &SecurityLimits) -> Result<Numbering, DocxParseError> {
         let xml = format!(
             r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{body}</w:numbering>"#
         );
@@ -4922,9 +4960,12 @@ mod tests {
             styles: None,
             theme: None,
         };
-        parser
-            .parse_numbering(&xml, &mut SecurityBudget::with_defaults())
-            .unwrap()
+        parser.parse_numbering(&xml, &mut SecurityBudget::from_limits(limits))
+    }
+
+    /// `word/numbering.xml` holding `body`, as the parser reads it.
+    fn numbering_of(body: &str) -> Numbering {
+        parse_numbering_with(body, &SecurityLimits::default()).unwrap()
     }
 
     /// The labels of paragraphs at `sequence`'s `(numId, ilvl)`, in order.
@@ -4993,6 +5034,76 @@ mod tests {
         assert_eq!(
             labels_in_order(&numbering, &[(2, 0), (2, 0), (1, 0), (3, 0), (4, 0), (4, 0)]),
             some_labels(&["1)", "2)", "3.", "d)", "(7)", "(8)"])
+        );
+    }
+
+    /// Limits a short template fits and a long one does not: 64 bytes for one string, 128
+    /// for all the text.
+    fn tight_limits() -> SecurityLimits {
+        SecurityLimits {
+            max_entity_length: 64,
+            max_content_size: 128,
+            ..SecurityLimits::default()
+        }
+    }
+
+    /// A `w:lvlText` or `w:numFmt` longer than an entity may be is refused while
+    /// `numbering.xml` is read, before it is kept or painted.
+    #[test]
+    fn test_numbering_refuses_a_level_string_longer_than_an_entity() {
+        let level_of = |properties: &str| {
+            format!(
+                r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0">{properties}</w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#
+            )
+        };
+        let too_long = SecurityError::EntityTooLong { length: 80, max: 64 }.to_string();
+        let template = "%1".repeat(40);
+        let format = "x".repeat(80);
+        for properties in [
+            format!(r#"<w:numFmt w:val="lowerLetter"/><w:lvlText w:val="{template}"/>"#),
+            format!(r#"<w:numFmt w:val="{format}"/><w:lvlText w:val="%1."/>"#),
+        ] {
+            let result = parse_numbering_with(&level_of(&properties), &tight_limits());
+            assert!(
+                matches!(&result, Err(DocxParseError::SecurityLimit(message)) if *message == too_long),
+                "{properties}: {result:?}"
+            );
+        }
+        // The same level with a short template is read under the same limits. ~keep
+        let short = parse_numbering_with(
+            &level_of(r#"<w:numFmt w:val="lowerLetter"/><w:lvlText w:val="(%1)"/>"#),
+            &tight_limits(),
+        );
+        assert!(short.is_ok(), "{short:?}");
+    }
+
+    /// Each piece of a label counts against the content limit before it is appended, so a
+    /// label that would pass the limit stops there instead of being painted in full first.
+    #[test]
+    fn test_list_label_stops_at_the_content_limit_while_painting() {
+        // Thirty placeholders fit in a 64-byte entity. At the last count a letter counter
+        // writes, each paints 32 letters: 960 bytes in all, against a limit of 128. ~keep
+        let mut level = numbered_level("lowerLetter", &"%1".repeat(30));
+        level.start = Some(26 * 32);
+        let (list_types, levels) = list_of_levels(vec![level]);
+        let mut paragraph = Paragraph::new();
+        paragraph.numbering_id = Some(1);
+        paragraph.numbering_level = Some(0);
+        let mut budget = SecurityBudget::from_limits(&tight_limits());
+
+        let result = label_list_paragraph(
+            &paragraph,
+            &list_types,
+            &levels,
+            &mut ListCounting::default(),
+            &mut budget,
+        );
+
+        // The error reports the running total where painting stopped: one 32-letter piece
+        // past the limit, not the whole 960-byte label. ~keep
+        assert!(
+            matches!(result, Err(SecurityError::ContentTooLarge { size, max: 128 }) if size <= 128 + 32),
+            "{result:?}"
         );
     }
 
