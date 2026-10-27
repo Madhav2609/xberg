@@ -18,7 +18,8 @@ const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main
 
 /// List 1 numbers exam questions (`Q%1.`, then `(%2)`). Lists 2 and 3 share a clause definition
 /// that starts at 3 and whose third level never restarts; list 3 restarts it at 10. List 4 is a
-/// plain `1.`, `2.` list, and list 5 a bullet list with a numbered second level.
+/// plain `1.`, `2.` list, and list 5 a bullet list with a numbered second level. List 6 numbers
+/// questions from 3 without writing a `w:numFmt`.
 const NUMBERING_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:abstractNum w:abstractNumId="0">
@@ -37,11 +38,15 @@ const NUMBERING_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="
     <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="-"/></w:lvl>
     <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%2."/></w:lvl>
   </w:abstractNum>
+  <w:abstractNum w:abstractNumId="4">
+    <w:lvl w:ilvl="0"><w:start w:val="3"/><w:lvlText w:val="Q%1."/></w:lvl>
+  </w:abstractNum>
   <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
   <w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
   <w:num w:numId="3"><w:abstractNumId w:val="1"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="10"/></w:lvlOverride></w:num>
   <w:num w:numId="4"><w:abstractNumId w:val="2"/></w:num>
   <w:num w:numId="5"><w:abstractNumId w:val="3"/></w:num>
+  <w:num w:numId="6"><w:abstractNumId w:val="4"/></w:num>
 </w:numbering>"#;
 
 /// Build a minimal `.docx` with `body_xml` and [`NUMBERING_XML`].
@@ -188,6 +193,29 @@ fn a_numbered_level_under_a_bullet_keeps_even_a_plain_number() {
         doc.content
     );
     assert!(doc.content.contains("  - 1\\. Apple."), "content:\n{}", doc.content);
+}
+
+/// A level that writes no `w:numFmt` is decimal (ISO/IEC 29500-1 §17.9.18), so Word paints
+/// `Q3.` and `Q4.` here.
+#[test]
+fn a_level_without_a_number_format_is_numbered_in_decimal() {
+    let body = format!(
+        "{}{}",
+        list_item(6, 0, "Define speed."),
+        list_item(6, 0, "Define velocity.")
+    );
+
+    let doc = extract(&body);
+
+    assert_eq!(
+        list_markers(&doc),
+        vec![Some("Q3.".to_string()), Some("Q4.".to_string())],
+        "content:\n{}",
+        doc.content
+    );
+    for line in ["- Q3. Define speed.", "- Q4. Define velocity."] {
+        assert!(doc.content.contains(line), "missing {line:?} in:\n{}", doc.content);
+    }
 }
 
 #[test]

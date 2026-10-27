@@ -403,6 +403,18 @@ fn list_type_for_num_fmt(fmt: Option<&str>) -> ListType {
     }
 }
 
+/// Whether a level is a bullet or numbered, or `None` to leave it unnumbered as before.
+///
+/// An omitted `w:numFmt` is decimal (§17.9.18), so a level with a `w:lvlText` and no format is
+/// numbered. A level with neither shows no number in Word, which a counted item would misstate.
+fn level_list_type(level: &NumberingLevel) -> Option<ListType> {
+    match (level.num_fmt.as_deref(), level.lvl_text.as_deref()) {
+        (Some(num_fmt), _) => Some(list_type_for_num_fmt(Some(num_fmt))),
+        (None, Some(_)) => Some(ListType::Numbered),
+        (None, None) => None,
+    }
+}
+
 /// One pass over `word/numbering.xml`.
 #[derive(Default)]
 struct NumberingReader {
@@ -459,13 +471,13 @@ impl NumberingReader {
         let mut list_types = AHashMap::new();
         for (num_id, abstract_id) in &self.levels.num_to_abstract {
             for lvl in 0..LIST_LEVELS as i64 {
-                let num_fmt = self
+                let list_type = self
                     .levels
                     .definitions
                     .get(&(*abstract_id, lvl))
-                    .and_then(|level| level.num_fmt.as_deref());
-                if let Some(num_fmt) = num_fmt {
-                    list_types.insert((*num_id, lvl), list_type_for_num_fmt(Some(num_fmt)));
+                    .and_then(level_list_type);
+                if let Some(list_type) = list_type {
+                    list_types.insert((*num_id, lvl), list_type);
                 }
             }
         }
@@ -4614,7 +4626,9 @@ mod tests {
         let mut list_types = AHashMap::new();
         for (lvl, definition) in definitions.into_iter().enumerate() {
             let lvl = lvl as i64;
-            list_types.insert((1, lvl), list_type_for_num_fmt(definition.num_fmt.as_deref()));
+            if let Some(list_type) = level_list_type(&definition) {
+                list_types.insert((1, lvl), list_type);
+            }
             levels.definitions.insert((0, lvl), definition);
         }
         (list_types, levels)
@@ -4773,7 +4787,7 @@ mod tests {
 
     #[test]
     fn test_numbering_reads_what_a_list_label_needs() {
-        let xml = r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="2"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="&#40;%1&#41;"/></w:lvl><w:lvl w:ilvl="1"><w:lvlRestart w:val="0"/><w:isLgl/><w:lvlText w:val="%1.%2"/></w:lvl><w:lvl w:ilvl="9"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="5"/></w:lvlOverride></w:num></w:numbering>"#;
+        let xml = r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="2"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="&#40;%1&#41;"/></w:lvl><w:lvl w:ilvl="1"><w:lvlRestart w:val="0"/><w:isLgl/><w:lvlText w:val="%1.%2"/></w:lvl><w:lvl w:ilvl="2"><w:start w:val="1"/></w:lvl><w:lvl w:ilvl="9"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="5"/></w:lvlOverride></w:num></w:numbering>"#;
         let parser = DocxParser {
             archive: zip::ZipArchive::new(std::io::Cursor::new(create_minimal_zip())).unwrap(),
             relationships: AHashMap::new(),
@@ -4808,9 +4822,12 @@ mod tests {
         assert_eq!(levels.definition(2, 0), levels.definition(1, 0));
         assert_eq!((levels.start(1, 0), levels.start(2, 0)), (2, 5));
         // Word has no level 9, so none is kept. ~keep
-        assert_eq!(levels.definitions.len(), 2);
+        assert_eq!(levels.definitions.len(), 3);
         assert_eq!(numbering.list_types.get(&(1, 0)), Some(&ListType::Numbered));
-        assert_eq!(numbering.list_types.get(&(1, 1)), None);
+        // Level 1 writes no `w:numFmt`, which is decimal (§17.9.18). Level 2 has no format and
+        // no `w:lvlText` either, so Word shows no number for it and none is counted. ~keep
+        assert_eq!(numbering.list_types.get(&(1, 1)), Some(&ListType::Numbered));
+        assert_eq!(numbering.list_types.get(&(1, 2)), None);
     }
 
     #[test]
